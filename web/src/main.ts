@@ -17,6 +17,7 @@ import {
   sampleChunkCatmullRom,
   type BinaryChunk,
 } from './motionBuffer';
+import { MotionBankEngine } from './motionBank';
 import { createMocapPavilion } from './pavilion';
 import { SomaSkinnedCharacter } from './somaSkin';
 import {
@@ -194,20 +195,102 @@ async function boot(): Promise<void> {
   const pavilion = createMocapPavilion();
   scene.add(pavilion.group);
 
-  // Fetch initial session + load NVIDIA's official SOMA human GLB in parallel!
-  const [initRes, somaSkin] = await Promise.all([
-    fetch(`${API_BASE}/api/init`),
-    SomaSkinnedCharacter.load('/models/soma_human.glb', {
+  // Completely internal engine resolution (ZERO URL query parameters required!):
+  // - Hosted static builds (`VITE_ENGINE_LOCKED=true`) or any non-localhost domain:
+  //   always boots directly into Locked Pre-Baked mode (zero localhost probe).
+  // - Local dev (`localhost`/`127.0.0.1` with `server/api.py` live):
+  //   boots into Live FP16 ONNX AND preloads the 0.38 MB Pre-Baked bank so the slider toggles live!
+  const viteEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  const IS_HOSTED_LOCKED = viteEnv?.VITE_ENGINE_LOCKED === 'true';
+
+  async function bootMotionEngines(): Promise<{
+    initData: InitPayload;
+    bank: MotionBankEngine | null;
+    liveAvailable: boolean;
+    initialMode: 'live-onnx' | 'baked-bank';
+  }> {
+    const host = window.location.hostname;
+    const isLocalHost = host === 'localhost' || host === '127.0.0.1' || host === '';
+
+    if (!IS_HOSTED_LOCKED && isLocalHost) {
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(), 700);
+      try {
+        const res = await fetch(`${API_BASE}/api/init`, { signal: ctrl.signal });
+        window.clearTimeout(timer);
+        if (res.ok) {
+          const liveData = (await res.json()) as InitPayload;
+          // Silently preload the tiny 0.38 MB bank too so the local slider toggles seamlessly!
+          const bank = await MotionBankEngine.load('./models/motion-bank.bin').catch(() => null);
+          return {
+            initData: liveData,
+            bank,
+            liveAvailable: true,
+            initialMode: 'live-onnx',
+          };
+        }
+      } catch {
+        window.clearTimeout(timer);
+      }
+    }
+
+    const bank = await MotionBankEngine.load('./models/motion-bank.bin');
+    return {
+      initData: bank.initData as unknown as InitPayload,
+      bank,
+      liveAvailable: false,
+      initialMode: 'baked-bank',
+    };
+  }
+
+  // Load engine(s) + NVIDIA's official SOMA human GLB in parallel!
+  const [sessionBoot, somaSkin] = await Promise.all([
+    bootMotionEngines(),
+    SomaSkinnedCharacter.load('./models/soma_human.glb', {
       xrayOpacity: 0.22,
       xrayAccentHex: '#38bdf8',
       restPoseCorrection: 'none',
     }),
   ]);
-  const initData = (await initRes.json()) as InitPayload;
+  const { initData, bank: motionBank, liveAvailable } = sessionBoot;
+  let engineMode: 'live-onnx' | 'baked-bank' = sessionBoot.initialMode;
   const sessionId = initData.session_id;
   const boneNames = initData.bone_names;
   const numRenderJoints = initData.model.render_joints || 24;
   const numBoneJoints = boneNames.length || 26;
+
+  // Wire top-left Engine Mode Slider (Pre-Baked <-> Live ONNX)
+  const engineSliderEl = document.getElementById('engine-slider');
+  const engineOptBakedEl = document.getElementById('engine-opt-baked');
+  const engineOptLiveEl = document.getElementById('engine-opt-live');
+  const engineToastEl = document.getElementById('engine-toast');
+  const statusDotEarly = document.getElementById('status-dot');
+  let engineToastTimer: number | null = null;
+  let engineBounceTimer: number | null = null;
+
+  function showEngineToast(msg: string, durationMs = 4200): void {
+    if (!engineToastEl) return;
+    engineToastEl.textContent = msg;
+    engineToastEl.classList.remove('hidden');
+    if (engineToastTimer !== null) window.clearTimeout(engineToastTimer);
+    engineToastTimer = window.setTimeout(() => {
+      engineToastEl.classList.add('hidden');
+      engineToastTimer = null;
+    }, durationMs);
+  }
+
+  function syncEngineSliderUI(): void {
+    const isLive = engineMode === 'live-onnx';
+    if (engineSliderEl) {
+      engineSliderEl.dataset.mode = isLive ? 'live' : 'baked';
+      engineSliderEl.classList.toggle('locked', !liveAvailable);
+      engineSliderEl.setAttribute('aria-checked', String(isLive));
+    }
+    engineOptBakedEl?.classList.toggle('active', !isLive);
+    engineOptLiveEl?.classList.toggle('active', isLive);
+    statusDotEarly?.classList.toggle('baked', !isLive);
+  }
+  syncEngineSliderUI();
 
   // Hero visuals: official NVIDIA SOMA SkinnedMesh + clean precision bone skeleton for X-Ray mode
   const skeletonRig = new NeuralSkeletonRig(0x38bdf8);
@@ -1300,18 +1383,83 @@ async function boot(): Promise<void> {
     inertializer.reset();
     footLocker.reset();
 
-    const res = await fetch(`${API_BASE}/api/reset`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
-    });
-    const data = await res.json();
+    let data: { pose: { pos: Vec3Tuple[]; bone_quat?: QuatTuple[] } };
+    if (engineMode === 'baked-bank' && motionBank) {
+      data = motionBank.reset() as { pose: { pos: Vec3Tuple[]; bone_quat?: QuatTuple[] } };
+    } else {
+      const res = await fetch(`${API_BASE}/api/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      data = await res.json();
+    }
     seedInitialPose(data.pose.pos, data.pose.bone_quat);
     trajGeo.setDrawRange(0, 0);
     syncOverlayVisibility();
     updateModeBanner();
     triggerInterrupt('idle');
   }
+
+  // Wire Engine Mode Slider Switch (Pre-Baked <-> Live ONNX)
+  function requestEngineMode(target: 'baked-bank' | 'live-onnx'): void {
+    if (target === 'live-onnx' && !liveAvailable) {
+      // Hosted / locked mode: briefly slide toward Live ONNX, show clear message, then spring back to Pre-Baked!
+      if (engineSliderEl) {
+        engineSliderEl.classList.add('bouncing');
+        if (engineBounceTimer !== null) window.clearTimeout(engineBounceTimer);
+        engineBounceTimer = window.setTimeout(() => {
+          engineSliderEl.classList.remove('bouncing');
+          engineBounceTimer = null;
+        }, 460);
+      }
+      const mbLabel = motionBank ? (motionBank.byteSize / (1024 * 1024)).toFixed(2) : '0.38';
+      showEngineToast(
+        `Live FP16 ONNX (363 MB) runs on a local server — clone the GitHub repo to run live ~25 ms inference. Staying on Pre-Baked (${mbLabel} MB).`,
+        4500
+      );
+      return;
+    }
+
+    if (target === 'baked-bank' && !motionBank) {
+      showEngineToast('Pre-Baked motion bank not loaded.', 2800);
+      return;
+    }
+
+    if (target === engineMode) return;
+
+    engineMode = target;
+    nextChunk = null;
+    pendingInterrupt = null;
+    if (engineMode === 'baked-bank' && motionBank) {
+      motionBank.syncAnchor(dispPos[0], dispPos[2], lastSteerDir.x, lastSteerDir.y);
+      const mbLabel = (motionBank.byteSize / (1024 * 1024)).toFixed(2);
+      statMs.textContent = 'Pre-Baked';
+      showEngineToast(`Switched to Pre-Baked neural bank (${mbLabel} MB · zero-server playback)`, 2800);
+    } else {
+      showEngineToast('Switched to Live FP16 ONNX local server (~25 ms real-time inference)', 2800);
+    }
+    syncEngineSliderUI();
+    triggerInterrupt(mode === 'steer' ? 'steer' : 'idle', mode === 'steer' ? lastSteerDir : undefined);
+  }
+
+  engineOptBakedEl?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    requestEngineMode('baked-bank');
+  });
+  engineOptLiveEl?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    requestEngineMode('live-onnx');
+  });
+  engineSliderEl?.addEventListener('click', () => {
+    requestEngineMode(engineMode === 'baked-bank' ? 'live-onnx' : 'baked-bank');
+  });
+  engineSliderEl?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      requestEngineMode(engineMode === 'baked-bank' ? 'live-onnx' : 'baked-bank');
+    }
+  });
 
   // Wire HUD buttons
   toggleGuidesBtn.addEventListener('click', toggleGuides);
@@ -1715,7 +1863,8 @@ async function boot(): Promise<void> {
       gotoTarget = null;
     }
 
-    statMs.textContent = `${Math.round(chunk.infer_ms)} ms`;
+    statMs.textContent =
+      engineMode === 'baked-bank' ? 'Pre-Baked' : `${Math.round(chunk.infer_ms)} ms`;
     updateOverlayGeometryFromChunk(chunk);
     syncOverlayVisibility();
   }
@@ -1755,14 +1904,21 @@ async function boot(): Promise<void> {
     statusDot.classList.add('busy');
 
     try {
-      const res = await fetch(`${API_BASE}/api/generate_bin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildGenerateBody(reqMode, baseChunkId, anchorFrame, dirOverride)),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = await res.arrayBuffer();
-      const chunk = decodeBinaryChunk(buf);
+      const reqBody = buildGenerateBody(reqMode, baseChunkId, anchorFrame, dirOverride);
+      let chunk: BinaryChunk;
+      if (engineMode === 'baked-bank' && motionBank) {
+        await Promise.resolve();
+        chunk = motionBank.generateChunk(reqBody);
+      } else {
+        const res = await fetch(`${API_BASE}/api/generate_bin`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        chunk = decodeBinaryChunk(buf);
+      }
 
       if (seq !== requestSeq) return;
 
@@ -1883,6 +2039,8 @@ async function boot(): Promise<void> {
       else syntheticSteer = new THREE.Vector2(dx, dz).normalize();
     },
     getState: () => ({
+      engineMode,
+      liveAvailable,
       mode,
       activeStyle,
       slowMo,
