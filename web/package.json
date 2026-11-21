@@ -1,0 +1,19 @@
+{
+  "name": "motionbricks-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host --port 5174",
+    "build": "tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "ps5-controller-webhid": "^0.1.1",
+    "three": "^0.174.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.174.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0"
+  }
+}
