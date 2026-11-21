@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 import struct
 import urllib.request
 from typing import Any
@@ -23,7 +24,7 @@ from typing import Any
 import numpy as np
 
 API = "http://127.0.0.1:8765"
-OUT_PATH = "/Users/ashutosh/development-work/g4-neon/motionbricks-web/web/public/models/motion-bank.bin"
+OUT_PATH = str(Path(__file__).resolve().parent.parent / "web/public/models/motion-bank.bin")
 POS_SCALE = 4000.0   # 0.25 mm resolution, range +-8.191 m relative to chunk start root XZ
 QUAT_SCALE = 32767.0
 
