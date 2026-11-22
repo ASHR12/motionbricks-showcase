@@ -241,13 +241,25 @@ async function boot(): Promise<void> {
       }
     }
 
-    const bank = await MotionBankEngine.load('./models/motion-bank.bin');
-    return {
-      initData: bank.initData as unknown as InitPayload,
-      bank,
-      liveAvailable: false,
-      initialMode: 'baked-bank',
-    };
+    try {
+      const bank = await MotionBankEngine.load('./models/motion-bank.bin');
+      return {
+        initData: bank.initData as unknown as InitPayload,
+        bank,
+        liveAvailable: false,
+        initialMode: 'baked-bank',
+      };
+    } catch {
+      const toast = document.getElementById('engine-toast');
+      if (toast) {
+        toast.textContent =
+          'No local ONNX server detected on :8765 and no local motion-bank.bin found. Start `python3 server/api.py` (or export a local bank with `python3 tools/export_motion_bank.py`) and reload.';
+        toast.classList.remove('hidden');
+      }
+      throw new Error(
+        'Neither local ONNX server (http://127.0.0.1:8765) nor web/public/models/motion-bank.bin is available.'
+      );
+    }
   }
 
   // Load engine(s) + NVIDIA's official SOMA human GLB in parallel!

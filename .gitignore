@@ -5,6 +5,6 @@ dist/
 __pycache__/
 *.py[cod]
 models/soma/*.onnx
-assets/bvh/*.bvh
-
 assets/bvh
+assets/bvh/*.bvh
+web/public/models/motion-bank.bin

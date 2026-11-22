@@ -67,32 +67,27 @@ For instant zero-server browser play in static deployments, MotionBrain also inc
 
 ## Quick Start & Commands
 
-### Option A — Instant Browser Play (`Pre-Baked` 0.38 MB Bank, Zero Python Setup)
-
-```bash
-cd web
-npm install
-npm run dev
-# Opens at http://localhost:5174 using web/public/models/motion-bank.bin
-```
-
-### Option B — Full Real-Time `Live ONNX` Mode (Local Apple Silicon / CPU, Zero NVIDIA GPU)
-
-> Download NVIDIA’s unquantized `mmm_v6_soma_fp16.onnx` (`363 MB`, place in `models/soma/`) and sample BVH motion seeds (`assets/bvh/`) from [`NVlabs/motionbricks`](https://github.com/NVlabs/motionbricks).
+> Download NVIDIA’s unquantized `mmm_v6_soma_fp16.onnx` (`363 MB`, place in `models/soma/`) and sample BVH motion seeds (`assets/bvh/`) from [`NVlabs/motionbricks`](https://github.com/NVlabs/motionbricks) after reviewing NVIDIA's model and sample-data licenses.
 
 ```bash
 # 1. Start the local FP16 ONNX neural motion server (http://127.0.0.1:8765)
 python3 server/api.py
 
-# 2. Launch the Three.js r174 WebGL2 studio (http://localhost:5174) and switch to Live ONNX
+# 2. Launch the Three.js r174 WebGL2 studio (http://localhost:5174)
 cd web
 npm install
 npm run dev
 
-# 3. Optional: Re-export the 0.38 MB Pre-Baked browser motion bank from the running server
+# 3. Optional: Export a local 0.38 MB Pre-Baked browser motion bank for local evaluation
+#    (motion-bank.bin is gitignored and excluded from this repo to respect NVIDIA's Sample Data terms)
 python3 tools/export_motion_bank.py
 
 # 4. Run biomechanical invariant suite (43/43) & automated browser verification (8/8)
 python3 tools/test_motion_invariants.py
 node tools/verify_studio.mjs
 ```
+
+## License
+
+- **Original source code:** [MIT License](LICENSE) (Copyright © 2026 Ashutosh Shrivastava).
+- **Third-party models, NVIDIA SOMA assets, and runtime dependencies:** See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (`NVlabs/motionbricks` Apache-2.0 / CC-BY-4.0 / NVIDIA Open Model Agreement, and `dualsense-ts` LGPL-3.0 via `ps5-controller-webhid`). External ONNX weights, sample BVHs, and local `motion-bank.bin` exports are excluded from this repository.
