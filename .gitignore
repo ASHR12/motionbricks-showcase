@@ -6,3 +6,5 @@ __pycache__/
 *.py[cod]
 models/soma/*.onnx
 assets/bvh/*.bvh
+
+assets/bvh

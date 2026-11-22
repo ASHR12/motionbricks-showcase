@@ -9,6 +9,7 @@ Neural Combat Punches (Left Jab / Right Cross / Combat Recover), and Smart Primi
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import struct
@@ -761,6 +762,8 @@ class SessionState:
     local_quat: np.ndarray | None = None   # [F, J, 4]
     history_pos: np.ndarray | None = None  # [4, J, 3]
     history_quat: np.ndarray | None = None # [4, J, 4]
+    # Live mutable gym obstacle layout for this session (supports Edit Gym drag/rotate/shuffle!)
+    obstacles: list[dict[str, Any]] = field(default_factory=lambda: copy.deepcopy(GYM_OBSTACLES))
 
 
 class MotionBricksRuntime:
@@ -987,7 +990,7 @@ class MotionBricksRuntime:
                 {"id": s["id"], "label": s["label"], "speed": s["speed"], "accent": s["accent"]}
                 for s in STYLE_SPECS
             ],
-            "obstacles": GYM_OBSTACLES,
+            "obstacles": copy.deepcopy(st.obstacles),
             "initial_pose": {
                 "pos": np.round(wp[-1, self.render_indices], 4).tolist(),
                 "quat": np.round(wq[-1, self.render_indices], 4).tolist(),
@@ -1072,21 +1075,79 @@ class MotionBricksRuntime:
         return dx / mag, dz / mag
 
     def _find_obstacle(
-        self, req: dict[str, Any], kind: str, cur_x: float, cur_z: float
+        self,
+        req: dict[str, Any],
+        kind: str,
+        cur_x: float,
+        cur_z: float,
+        obstacles: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Resolve any obstacle dynamically by `obstacle_id` or nearest matching type (zero hardcoded indices)."""
+        pool = obstacles if obstacles else GYM_OBSTACLES
         req_id = req.get("obstacle_id")
         if req_id:
-            for obs in GYM_OBSTACLES:
+            for obs in pool:
                 if obs["id"] == req_id:
                     return obs
-        candidates = [o for o in GYM_OBSTACLES if o["type"] == kind]
+        candidates = [o for o in pool if o["type"] == kind]
         if not candidates:
-            return GYM_OBSTACLES[0]
+            return pool[0]
         return min(
             candidates,
             key=lambda o: math.hypot(float(o["pos"][0]) - cur_x, float(o["pos"][2]) - cur_z),
         )
+
+    def update_obstacles(
+        self, session_id: str, incoming: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        """Update live gym obstacle positions/orientations for a session (Edit Gym / Shuffle / Reset)."""
+        with self.lock:
+            st = self.sessions.get(session_id)
+            if st is None:
+                raise KeyError(session_id)
+
+            if not incoming:
+                st.obstacles = copy.deepcopy(GYM_OBSTACLES)
+                return {"ok": True, "obstacles": copy.deepcopy(st.obstacles)}
+
+            by_id = {o["id"]: copy.deepcopy(o) for o in st.obstacles}
+            defaults_by_id = {o["id"]: copy.deepcopy(o) for o in GYM_OBSTACLES}
+            updated: list[dict[str, Any]] = []
+
+            for item in incoming:
+                oid = str(item.get("id", "")).strip()
+                if not oid:
+                    continue
+                base = by_id.get(oid) or defaults_by_id.get(oid)
+                if base is None:
+                    continue
+                size_in = item.get("size", base["size"])
+                if isinstance(size_in, (list, tuple)) and len(size_in) == 3:
+                    sx = float(np.clip(float(size_in[0]), 0.12, 4.5))
+                    sy = float(np.clip(float(size_in[1]), 0.12, 3.0))
+                    sz = float(np.clip(float(size_in[2]), 0.12, 4.5))
+                    base["size"] = [round(sx, 4), round(sy, 4), round(sz, 4)]
+
+                pos_in = item.get("pos", base["pos"])
+                if isinstance(pos_in, (list, tuple)) and len(pos_in) == 3:
+                    half_x = float(base["size"][0]) * 0.5 + 0.35
+                    half_z = float(base["size"][2]) * 0.5 + 0.35
+                    px = float(np.clip(float(pos_in[0]), ROOM_MIN_X + half_x, ROOM_MAX_X - half_x))
+                    pz = float(np.clip(float(pos_in[2]), ROOM_MIN_Z + half_z, ROOM_MAX_Z - half_z))
+                    base["pos"] = [round(px, 4), 0.0, round(pz, 4)]
+
+                facing_in = item.get("facing", base.get("facing"))
+                if isinstance(facing_in, (list, tuple)) and len(facing_in) == 2:
+                    fx, fz = float(facing_in[0]), float(facing_in[1])
+                    mag = math.hypot(fx, fz)
+                    if mag > 1e-4:
+                        base["facing"] = [round(fx / mag, 5), round(fz / mag, 5)]
+
+                updated.append(base)
+
+            if updated:
+                st.obstacles = updated
+            return {"ok": True, "obstacles": copy.deepcopy(st.obstacles)}
 
     def _synthesize_combat_roll(
         self,
@@ -1467,17 +1528,28 @@ class MotionBricksRuntime:
                 phase_done = True
 
             elif mode == "duck_entry":
-                obs = self._find_obstacle(req, "duck", cur_x, cur_z)
+                obs = self._find_obstacle(req, "duck", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
-                side_dir = float(req.get("duck_dir", 1.0 if cur_z <= bz else -1.0))
-                side_dir = 1.0 if side_dir >= 0 else -1.0
-                lane_x = float(req.get("duck_x", np.clip(cur_x - bx, -0.65, 0.65) + bx))
-                tgt_p, tgt_q = place_target_window(*self.duck_steps["entry"], lane_x, bz, 0.0, side_dir)
+                sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
+                cross_z = sz_w < sx_w  # Gantry spans X -> duck across Z; rotated spans Z -> duck across X
+                if cross_z:
+                    side_dir = float(req.get("duck_dir", 1.0 if cur_z <= bz else -1.0))
+                    side_dir = 1.0 if side_dir >= 0 else -1.0
+                    lane = float(req.get("duck_lane", req.get("duck_x", np.clip(cur_x - bx, -0.65, 0.65) + bx)))
+                    dx_t, dz_t, fdx, fdz = lane, bz, 0.0, side_dir
+                    approach_sign = (bz - cur_z) * side_dir
+                else:
+                    side_dir = float(req.get("duck_dir", 1.0 if cur_x <= bx else -1.0))
+                    side_dir = 1.0 if side_dir >= 0 else -1.0
+                    lane = float(req.get("duck_lane", req.get("duck_x", np.clip(cur_z - bz, -0.65, 0.65) + bz)))
+                    dx_t, dz_t, fdx, fdz = bx, lane, side_dir, 0.0
+                    approach_sign = (bx - cur_x) * side_dir
+                tgt_p, tgt_q = place_target_window(*self.duck_steps["entry"], dx_t, dz_t, fdx, fdz)
                 entry_x, entry_z = float(tgt_p[0, 0, 0]), float(tgt_p[0, 0, 2])
                 dist_entry = math.hypot(entry_x - cur_x, entry_z - cur_z)
-                dist_beam = math.hypot(lane_x - cur_x, bz - cur_z)
-                if dist_beam < 2.25 and ((bz - cur_z) * side_dir > 0.15):
-                    tgt_p, tgt_q = place_target_window(*self.duck_steps["action"], lane_x, bz, 0.0, side_dir)
+                dist_beam = math.hypot(dx_t - cur_x, dz_t - cur_z)
+                if dist_beam < 2.25 and approach_sign > 0.15:
+                    tgt_p, tgt_q = place_target_window(*self.duck_steps["action"], dx_t, dz_t, fdx, fdz)
                     allowed_tokens = (6, 7, 8)
                     transition_early = 3
                     mode = "duck_action"
@@ -1498,21 +1570,33 @@ class MotionBricksRuntime:
                     phase_done = True
 
             elif mode == "duck_action":
-                obs = self._find_obstacle(req, "duck", cur_x, cur_z)
+                obs = self._find_obstacle(req, "duck", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
+                sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
+                cross_z = sz_w < sx_w
                 side_dir = 1.0 if float(req.get("duck_dir", -1.0)) >= 0 else -1.0
-                lane_x = float(req.get("duck_x", bx))
-                tgt_p, tgt_q = place_target_window(*self.duck_steps["action"], lane_x, bz, 0.0, side_dir)
+                if cross_z:
+                    lane = float(req.get("duck_lane", req.get("duck_x", bx)))
+                    tgt_p, tgt_q = place_target_window(*self.duck_steps["action"], lane, bz, 0.0, side_dir)
+                else:
+                    lane = float(req.get("duck_lane", req.get("duck_x", bz)))
+                    tgt_p, tgt_q = place_target_window(*self.duck_steps["action"], bx, lane, side_dir, 0.0)
                 allowed_tokens = (6, 7, 8)
                 transition_early = 2
                 phase_done = True
 
             elif mode == "duck_exit":
-                obs = self._find_obstacle(req, "duck", cur_x, cur_z)
+                obs = self._find_obstacle(req, "duck", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
+                sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
+                cross_z = sz_w < sx_w
                 side_dir = 1.0 if float(req.get("duck_dir", -1.0)) >= 0 else -1.0
-                lane_x = float(req.get("duck_x", bx))
-                tgt_p, tgt_q = place_target_window(*self.duck_steps["exit"], lane_x, bz, 0.0, side_dir)
+                if cross_z:
+                    lane = float(req.get("duck_lane", req.get("duck_x", bx)))
+                    tgt_p, tgt_q = place_target_window(*self.duck_steps["exit"], lane, bz, 0.0, side_dir)
+                else:
+                    lane = float(req.get("duck_lane", req.get("duck_x", bz)))
+                    tgt_p, tgt_q = place_target_window(*self.duck_steps["exit"], bx, lane, side_dir, 0.0)
                 allowed_tokens = (6, 7, 8)
                 transition_early = 5
                 phase_done = True
@@ -1587,7 +1671,7 @@ class MotionBricksRuntime:
                             transition_early = 6
 
             elif mode == "vault_entry":
-                obs = self._find_obstacle(req, "vault", cur_x, cur_z)
+                obs = self._find_obstacle(req, "vault", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
                 sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
                 cross_z = sz_w < sx_w  # Wall spans along X -> vault across Z!
@@ -1630,7 +1714,7 @@ class MotionBricksRuntime:
                     phase_done = True
 
             elif mode == "vault_action":
-                obs = self._find_obstacle(req, "vault", cur_x, cur_z)
+                obs = self._find_obstacle(req, "vault", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
                 sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
                 cross_z = sz_w < sx_w
@@ -1646,7 +1730,7 @@ class MotionBricksRuntime:
                 phase_done = True
 
             elif mode == "vault_exit":
-                obs = self._find_obstacle(req, "vault", cur_x, cur_z)
+                obs = self._find_obstacle(req, "vault", cur_x, cur_z, st.obstacles)
                 bx, bz = float(obs["pos"][0]), float(obs["pos"][2])
                 sx_w, _, sz_w = float(obs["size"][0]), float(obs["size"][1]), float(obs["size"][2])
                 cross_z = sz_w < sx_w
@@ -1662,7 +1746,7 @@ class MotionBricksRuntime:
                 phase_done = True
 
             elif mode == "sit_approach":
-                obs = self._find_obstacle(req, "sit", cur_x, cur_z)
+                obs = self._find_obstacle(req, "sit", cur_x, cur_z, st.obstacles)
                 sx, sz = float(obs["pos"][0]), float(obs["pos"][2])
                 fx, fz = float(obs["facing"][0]), float(obs["facing"][1])
                 # Approach point: 1.05 m in front of the bench
@@ -1685,7 +1769,7 @@ class MotionBricksRuntime:
                     phase_done = True
 
             elif mode == "sit_down":
-                obs = self._find_obstacle(req, "sit", cur_x, cur_z)
+                obs = self._find_obstacle(req, "sit", cur_x, cur_z, st.obstacles)
                 sx, sz = float(obs["pos"][0]), float(obs["pos"][2])
                 fx, fz = float(obs["facing"][0]), float(obs["facing"][1])
                 tgt_p, tgt_q = place_target_window(*self.sit_steps["seated"], sx, sz, fx, fz)
@@ -1695,7 +1779,7 @@ class MotionBricksRuntime:
                 phase_done = True
 
             elif mode == "sit_hold":
-                obs = self._find_obstacle(req, "sit", cur_x, cur_z)
+                obs = self._find_obstacle(req, "sit", cur_x, cur_z, st.obstacles)
                 sx, sz = float(obs["pos"][0]), float(obs["pos"][2])
                 fx, fz = float(obs["facing"][0]), float(obs["facing"][1])
                 tgt_p, tgt_q = place_target_window(*self.sit_steps["seated"], sx, sz, fx, fz)
@@ -1705,7 +1789,7 @@ class MotionBricksRuntime:
                 phase_done = True
 
             elif mode == "stand_up":
-                obs = self._find_obstacle(req, "sit", cur_x, cur_z)
+                obs = self._find_obstacle(req, "sit", cur_x, cur_z, st.obstacles)
                 sx, sz = float(obs["pos"][0]), float(obs["pos"][2])
                 fx, fz = float(obs["facing"][0]), float(obs["facing"][1])
                 tgt_p, tgt_q = place_target_window(*self.sit_steps["to_stand"], sx, sz, fx, fz)
@@ -1970,6 +2054,16 @@ class APIHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 import traceback
                 traceback.print_exc()
+                self._send_json(500, {"error": str(exc)})
+        elif self.path == "/api/obstacles":
+            try:
+                sid = str(data.get("session_id", ""))
+                obs_list = data.get("obstacles")
+                out = RUNTIME.update_obstacles(sid, obs_list if isinstance(obs_list, list) else None)
+                self._send_json(200, out)
+            except KeyError:
+                self._send_json(404, {"error": "Unknown session_id"})
+            except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
         elif self.path == "/api/reset":
             sid = str(data.get("session_id", ""))

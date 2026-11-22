@@ -180,6 +180,25 @@ export class MotionBankEngine {
     this.curHeadingZ = nhz;
   }
 
+  /** Sync live moved/rotated/shuffled gym obstacles from Edit Gym into the Pre-Baked planner */
+  setObstacles(obstacles: Array<{
+    id: string;
+    type: string;
+    label?: string;
+    pos: [number, number, number];
+    size: [number, number, number];
+    clearance?: number;
+    facing?: [number, number];
+    color?: string;
+  }>): void {
+    this.initData.obstacles = obstacles.map((o) => ({
+      ...o,
+      pos: [o.pos[0], o.pos[1], o.pos[2]],
+      size: [o.size[0], o.size[1], o.size[2]],
+      ...(o.facing ? { facing: [o.facing[0], o.facing[1]] } : {}),
+    }));
+  }
+
   private findObstacle(id: unknown, fallbackType: string): {
     id: string;
     type: string;
@@ -352,18 +371,19 @@ export class MotionBankEngine {
       const dClip = this.getClip('action:duck_action');
       const entryDist = dClip.entry.extra?.entry_dist ?? 1.5;
       if (obs) {
+        const crossZ = obs.size[2] < obs.size[0];
         const dDir = Number(req.duck_dir ?? -1) >= 0 ? 1 : -1;
-        const laneX = Number(req.duck_x ?? obs.pos[0]);
-        const goalX = laneX;
-        const goalZ = obs.pos[2] - dDir * entryDist;
+        const lane = Number(req.duck_lane ?? req.duck_x ?? (crossZ ? obs.pos[0] : obs.pos[2]));
+        const goalX = crossZ ? lane : obs.pos[0] - dDir * entryDist;
+        const goalZ = crossZ ? obs.pos[2] - dDir * entryDist : lane;
         const gx = goalX - anchor.x;
         const gz = goalZ - anchor.z;
         const dist = Math.hypot(gx, gz);
         if (dist <= 0.65) {
           clip = dClip;
           outMode = 'duck_action';
-          headX = 0;
-          headZ = dDir;
+          headX = crossZ ? 0 : dDir;
+          headZ = crossZ ? dDir : 0;
           phaseDone = true;
         } else {
           clip = this.getClip('steer:jog', 'steer:walk');
@@ -387,12 +407,14 @@ export class MotionBankEngine {
       clip = this.getClip(`action:${mode}`);
       const obs = this.findObstacle(req.obstacle_id, 'duck');
       if (obs) {
+        const crossZ = obs.size[2] < obs.size[0];
         const dDir = Number(req.duck_dir ?? -1) >= 0 ? 1 : -1;
-        headX = 0;
-        headZ = dDir;
+        headX = crossZ ? 0 : dDir;
+        headZ = crossZ ? dDir : 0;
         if (mode === 'duck_action') {
-          const laneX = Number(req.duck_x ?? obs.pos[0]);
-          placeX = placeX * 0.35 + laneX * 0.65;
+          const lane = Number(req.duck_lane ?? req.duck_x ?? (crossZ ? obs.pos[0] : obs.pos[2]));
+          if (crossZ) placeX = placeX * 0.35 + lane * 0.65;
+          else placeZ = placeZ * 0.35 + lane * 0.65;
         }
       }
       phaseDone = true;

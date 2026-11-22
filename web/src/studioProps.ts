@@ -12,6 +12,14 @@ export interface StudioObstacleSpec {
   color: string;
 }
 
+export interface StudioObstacleManager {
+  getClickTargets(): THREE.Object3D[];
+  getEditTargets(): THREE.Object3D[];
+  syncObstacle(obs: StudioObstacleSpec): void;
+  syncAll(specs: StudioObstacleSpec[]): void;
+  setEditVisuals(editActive: boolean, hoveredId: string | null, selectedId: string | null): void;
+}
+
 /**
  * Builds a chamfered trapezoidal concrete vault monolith in the XY cross-section extruded along Z.
  * Final dimensions: bottom width = baseW, top width = topW, height = baseY..topY, length = lengthZ.
@@ -97,13 +105,69 @@ export function buildStudioObstacles(
   scene: THREE.Scene,
   sensorZoneGroup: THREE.Group
 ): THREE.Object3D[] {
-  const clickTargets: THREE.Object3D[] = [];
+  return createStudioObstacleManager(specs, scene, sensorZoneGroup).getClickTargets();
+}
 
-  const registerClickable = (meshes: THREE.Object3D[], obs: StudioObstacleSpec) => {
+interface ManagedObstacleEntry {
+  id: string;
+  type: StudioObstacleSpec['type'];
+  propGroup: THREE.Group;
+  orientGroup: THREE.Group | null;
+  zoneGroup: THREE.Group;
+  selGroup: THREE.Group;
+  selFillMat: THREE.MeshBasicMaterial;
+  selEdgeMat: THREE.LineBasicMaterial;
+  hitMeshes: THREE.Object3D[];
+}
+
+export function createStudioObstacleManager(
+  specs: StudioObstacleSpec[],
+  scene: THREE.Scene,
+  sensorZoneGroup: THREE.Group
+): StudioObstacleManager {
+  const clickTargets: THREE.Object3D[] = [];
+  const editTargets: THREE.Object3D[] = [];
+  const entries = new Map<string, ManagedObstacleEntry>();
+  const editOverlayGroup = new THREE.Group();
+  editOverlayGroup.name = 'EditGymOverlays';
+  editOverlayGroup.visible = false;
+  scene.add(editOverlayGroup);
+
+  const registerClickable = (meshes: THREE.Object3D[], obs: StudioObstacleSpec, bucket: THREE.Object3D[]) => {
     for (const m of meshes) {
       m.userData = { obstacle: obs };
       clickTargets.push(m);
+      editTargets.push(m);
+      bucket.push(m);
     }
+  };
+
+  const makeSelectionFootprint = (footW: number, footD: number, colorHex: string) => {
+    const selGroup = new THREE.Group();
+    const padW = footW + 0.24;
+    const padD = footD + 0.24;
+    const selFillMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(colorHex || '#38bdf8'),
+      transparent: true,
+      opacity: 0.08,
+      depthWrite: false,
+    });
+    const fill = new THREE.Mesh(new THREE.PlaneGeometry(padW, padD).rotateX(-Math.PI / 2), selFillMat);
+    fill.position.y = 0.011;
+
+    const selEdgeMat = new THREE.LineBasicMaterial({
+      color: 0x94a3b8,
+      transparent: true,
+      opacity: 0.55,
+    });
+    const outline = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(padW, 0.014, padD)),
+      selEdgeMat
+    );
+    outline.position.y = 0.014;
+    selGroup.add(fill, outline);
+    editOverlayGroup.add(selGroup);
+    return { selGroup, selFill: fill, selFillMat, selEdgeMat };
   };
 
   // Architectural material palette shared across props
@@ -190,21 +254,54 @@ export function buildStudioObstacles(
     metalness: 0.14,
   });
 
+  const applyTransform = (entry: ManagedObstacleEntry, obs: StudioObstacleSpec) => {
+    entry.propGroup.position.set(obs.pos[0], 0, obs.pos[2]);
+    entry.zoneGroup.position.set(obs.pos[0], 0, obs.pos[2]);
+    entry.selGroup.position.set(obs.pos[0], 0, obs.pos[2]);
+
+    if (entry.type === 'vault') {
+      const rot = obs.size[0] > obs.size[2] ? Math.PI / 2 : 0;
+      if (entry.orientGroup) entry.orientGroup.rotation.y = rot;
+      entry.zoneGroup.rotation.y = rot;
+      entry.selGroup.rotation.y = rot;
+    } else if (entry.type === 'duck' || entry.type === 'hurdle') {
+      const rot = obs.size[2] > obs.size[0] ? Math.PI / 2 : 0;
+      if (entry.orientGroup) entry.orientGroup.rotation.y = rot;
+      entry.zoneGroup.rotation.y = rot;
+      entry.selGroup.rotation.y = rot;
+    } else {
+      const yaw = obs.facing ? Math.atan2(-obs.facing[1], obs.facing[0]) : 0;
+      entry.propGroup.rotation.y = yaw;
+      entry.zoneGroup.rotation.y = yaw;
+      entry.selGroup.rotation.y = yaw;
+    }
+
+    for (const m of entry.hitMeshes) {
+      m.userData = { obstacle: obs };
+    }
+  };
+
   for (const obs of specs) {
     const [w, h, d] = obs.size;
     const propGroup = new THREE.Group();
     propGroup.name = `Prop_${obs.id}`;
-    propGroup.position.set(obs.pos[0], 0, obs.pos[2]);
-    if (obs.facing) {
-      propGroup.rotation.y = Math.atan2(-obs.facing[1], obs.facing[0]);
-    }
+    const zoneGroup = new THREE.Group();
+    zoneGroup.name = `Zone_${obs.id}`;
+    sensorZoneGroup.add(zoneGroup);
+    const hitMeshes: THREE.Object3D[] = [];
+    let orientGroup: THREE.Group | null = null;
+    let selData: {
+      selGroup: THREE.Group;
+      selFill: THREE.Mesh;
+      selFillMat: THREE.MeshBasicMaterial;
+      selEdgeMat: THREE.LineBasicMaterial;
+    };
 
     if (obs.type === 'vault') {
       // =====================================================================
       // SCULPTED TRAPEZOIDAL ARCHITECTURAL CONCRETE VAULT PLINTH (top = 0.82 m)
-      // Auto-orients along X when size[0] > size[2] (e.g. stress_vault along Z runway)
+      // Built canonically along Z; orientGroup rotates 90° when size[0] > size[2]
       // =====================================================================
-      const runsAcrossX = w > d;
       const lengthSpan = Math.max(w, d);
       // Matches exact 0.34 m BVH vault obstacle envelope (clean shin & sneaker clearance on takeoff!)
       const baseW = 0.36;
@@ -213,9 +310,7 @@ export function buildStudioObstacles(
       const monolithTopY = Math.max(0.4, h - 0.08); // 0.74 m when h = 0.82 m
 
       const vaultInner = new THREE.Group();
-      if (runsAcrossX) {
-        vaultInner.rotation.y = Math.PI / 2;
-      }
+      orientGroup = vaultInner;
 
       // Recessed shadow-gap dark anodized base plinth anchoring monolith to floor
       const baseSkirt = new THREE.Mesh(
@@ -299,23 +394,25 @@ export function buildStudioObstacles(
       propGroup.add(vaultInner);
       registerClickable(
         [baseSkirt, monolith, topBedPlate, railBar, bendPos, bendNeg, flangePos, flangeNeg],
-        obs
+        obs,
+        hitMeshes
       );
 
-      // Floor proximity sensor pad aligned along the crossing axis (only visible when AI Guides ON)
-      const zoneW = runsAcrossX ? lengthSpan + 0.3 : 4.3;
-      const zoneD = runsAcrossX ? 4.3 : lengthSpan + 0.3;
+      // Floor proximity sensor pad aligned along canonical crossing axis (X crossing, Z length)
+      const zoneW = 4.3;
+      const zoneD = lengthSpan + 0.3;
       const zoneFill = new THREE.Mesh(
         new THREE.PlaneGeometry(zoneW, zoneD).rotateX(-Math.PI / 2),
         new THREE.MeshBasicMaterial({ color: 0xfacc15, transparent: true, opacity: 0.055, depthWrite: false })
       );
-      zoneFill.position.set(obs.pos[0], 0.005, obs.pos[2]);
+      zoneFill.position.set(0, 0.005, 0);
       const zoneOutline = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.BoxGeometry(zoneW, 0.01, zoneD)),
         new THREE.LineBasicMaterial({ color: 0xfacc15, transparent: true, opacity: 0.42 })
       );
-      zoneOutline.position.set(obs.pos[0], 0.007, obs.pos[2]);
-      sensorZoneGroup.add(zoneFill, zoneOutline);
+      zoneOutline.position.set(0, 0.007, 0);
+      zoneGroup.add(zoneFill, zoneOutline);
+      selData = makeSelectionFootprint(baseW + 0.16, lengthSpan, '#facc15');
     } else if (obs.type === 'sit') {
       // =====================================================================
       // SCULPTED GALLERY BENCH (exact seat top = 0.44 m, warm copper-rose inlay)
@@ -376,19 +473,25 @@ export function buildStudioObstacles(
       legInlayR.position.set(legWidthX * 0.5 + 0.001, glideH + legH * 0.5, legOffsetZ - legThickZ * 0.5 + 0.005);
 
       propGroup.add(seat, legL, legR, glideL, glideR, stretcher, inlayPerimeter, legInlayL, legInlayR);
-      registerClickable([seat, legL, legR, stretcher, inlayPerimeter], obs);
+      registerClickable([seat, legL, legR, stretcher, inlayPerimeter], obs, hitMeshes);
+      selData = makeSelectionFootprint(w, d, '#f472b6');
     } else if (obs.type === 'duck') {
       // =====================================================================
       // OVERHEAD PARKOUR DUCK GANTRY (exact underside clearance = 1.35 m)
+      // Built canonically spanning X; orientGroup rotates 90° when size[2] > size[0]
       // =====================================================================
+      const spanW = Math.max(w, d);
       const clearH = obs.clearance ?? 1.35;
       const totalH = clearH + h; // 1.77 m
       const postW = 0.088;
       const postD = 0.098;
-      const postX = w * 0.5 + postW * 0.5 + 0.008; // clear inner span > 2.2 m
+      const postX = spanW * 0.5 + postW * 0.5 + 0.008; // clear inner span > 2.2 m
       const baseH = 0.026;
       const topBeamH = 0.096;
       const topBeamD = 0.112;
+
+      const duckInner = new THREE.Group();
+      orientGroup = duckInner;
 
       // Twin brushed-aluminum square-tube portal legs
       const postGeo = new THREE.BoxGeometry(postW, totalH - baseH, postD);
@@ -421,7 +524,7 @@ export function buildStudioObstacles(
           for (const bz of [-0.105, 0.105]) {
             const bolt = new THREE.Mesh(boltGeo, brushedAluminumMat);
             bolt.position.set(sideX + bx, baseH + 0.006, bz);
-            propGroup.add(bolt);
+            duckInner.add(bolt);
           }
         }
       }
@@ -438,7 +541,7 @@ export function buildStudioObstacles(
 
       // Recessed dark structural truss shadow channel running along the top beam
       const trussChannel = new THREE.Mesh(
-        new THREE.BoxGeometry(w + 0.02, 0.036, topBeamD + 0.006),
+        new THREE.BoxGeometry(spanW + 0.02, 0.036, topBeamD + 0.006),
         darkAnodizedMat
       );
       trussChannel.position.set(0, totalH - topBeamH * 0.5, 0);
@@ -453,7 +556,7 @@ export function buildStudioObstacles(
       // Suspended brushed-aluminum clearance housing + recessed matte-teal underside glow bar at EXACT y = 1.35 m
       const glowH = 0.012;
       const housingH = 0.032;
-      const clearanceSpanW = w - 0.10;
+      const clearanceSpanW = spanW - 0.10;
       const housingBottomY = clearH + glowH; // 1.362 m
       const housingTopY = housingBottomY + housingH; // 1.394 m
       const topBeamBottomY = totalH - topBeamH; // 1.674 m
@@ -493,7 +596,7 @@ export function buildStudioObstacles(
       );
       midTie.position.set(0, housingTopY + dropH * 0.58, 0);
 
-      propGroup.add(
+      duckInner.add(
         postL,
         postR,
         footL,
@@ -508,28 +611,31 @@ export function buildStudioObstacles(
         dropR,
         midTie
       );
+      propGroup.add(duckInner);
       registerClickable(
         [postL, postR, footL, footR, topBeam, trussChannel, clearanceHousing, clearanceStrip, dropL, dropR],
-        obs
+        obs,
+        hitMeshes
       );
 
-      // Floor proximity sensor pad (only visible when AI Guides ON)
+      // Floor proximity sensor pad (canonical X span, Z crossing)
       const zFill = new THREE.Mesh(
-        new THREE.PlaneGeometry(w + 0.2, 3.8).rotateX(-Math.PI / 2),
+        new THREE.PlaneGeometry(spanW + 0.2, 3.8).rotateX(-Math.PI / 2),
         new THREE.MeshBasicMaterial({ color: 0x2dd4bf, transparent: true, opacity: 0.055, depthWrite: false })
       );
-      zFill.position.set(obs.pos[0], 0.005, obs.pos[2]);
+      zFill.position.set(0, 0.005, 0);
       const zOut = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.BoxGeometry(w + 0.2, 0.01, 3.8)),
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(spanW + 0.2, 0.01, 3.8)),
         new THREE.LineBasicMaterial({ color: 0x2dd4bf, transparent: true, opacity: 0.42 })
       );
-      zOut.position.set(obs.pos[0], 0.007, obs.pos[2]);
-      sensorZoneGroup.add(zFill, zOut);
+      zOut.position.set(0, 0.007, 0);
+      zoneGroup.add(zFill, zOut);
+      selData = makeSelectionFootprint(spanW + 0.26, 0.42, '#2dd4bf');
     } else if (obs.type === 'hurdle') {
       // =====================================================================
       // ARCHITECTURAL LOW STEEL PARKOUR HURDLE RAIL (exact top = h, 0.46–0.48 m)
+      // Built canonically spanning X; orientGroup rotates 90° when size[2] > size[0]
       // =====================================================================
-      const runsAlongZ = d > w;
       const span = Math.max(w, d);
       const postX = Math.max(0.2, span * 0.5 - 0.055);
       const padH = 0.006;
@@ -541,9 +647,7 @@ export function buildStudioObstacles(
       const sightH = 0.006;
 
       const hurdleInner = new THREE.Group();
-      if (runsAlongZ) {
-        hurdleInner.rotation.y = Math.PI / 2;
-      }
+      orientGroup = hurdleInner;
 
       // Twin brushed-aluminum L-shaped floor baseplates + dark anti-slip pads + machined hex bolts
       const padGeo = new THREE.BoxGeometry(0.118, padH, 0.376);
@@ -640,23 +744,24 @@ export function buildStudioObstacles(
       hurdleInner.add(crossbar, sightlineStrip);
       hurdleClickables.push(crossbar, sightlineStrip);
       propGroup.add(hurdleInner);
-      registerClickable(hurdleClickables, obs);
+      registerClickable(hurdleClickables, obs, hitMeshes);
 
-      // Subtle amber AI Guides floor sensor zone aligned along crossing axis
-      const hZoneW = runsAlongZ ? 2.2 : span + 0.24;
-      const hZoneD = runsAlongZ ? span + 0.24 : 2.2;
+      // Subtle amber AI Guides floor sensor zone (canonical X span, Z crossing)
+      const hZoneW = span + 0.24;
+      const hZoneD = 2.2;
       const hFill = new THREE.Mesh(
         new THREE.PlaneGeometry(hZoneW, hZoneD).rotateX(-Math.PI / 2),
         new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.055, depthWrite: false })
       );
-      hFill.position.set(obs.pos[0], 0.005, obs.pos[2]);
+      hFill.position.set(0, 0.005, 0);
       const hOut = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.BoxGeometry(hZoneW, 0.01, hZoneD)),
         new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.42 })
       );
-      hOut.position.set(obs.pos[0], 0.007, obs.pos[2]);
-      sensorZoneGroup.add(hFill, hOut);
-    } else if (obs.type === 'block') {
+      hOut.position.set(0, 0.007, 0);
+      zoneGroup.add(hFill, hOut);
+      selData = makeSelectionFootprint(span + 0.06, 0.42, '#f59e0b');
+    } else {
       // =====================================================================
       // STEPPED BRUTALIST CONCRETE PLYO BLOCK (exact top = h = 0.40 m)
       // =====================================================================
@@ -729,7 +834,7 @@ export function buildStudioObstacles(
       }
 
       propGroup.add(skirt, lowerTier, stepGroove, upperTier, copperReveal, ...cornerBeads);
-      registerClickable([skirt, lowerTier, stepGroove, upperTier, copperReveal, ...cornerBeads], obs);
+      registerClickable([skirt, lowerTier, stepGroove, upperTier, copperReveal, ...cornerBeads], obs, hitMeshes);
 
       // Subtle AI Guides floor sensor zone framing the plyo block
       const bColor = new THREE.Color(obs.color || '#a8a29e');
@@ -739,22 +844,72 @@ export function buildStudioObstacles(
         new THREE.PlaneGeometry(bZoneW, bZoneD).rotateX(-Math.PI / 2),
         new THREE.MeshBasicMaterial({ color: bColor, transparent: true, opacity: 0.055, depthWrite: false })
       );
-      bFill.position.set(obs.pos[0], 0.005, obs.pos[2]);
+      bFill.position.set(0, 0.005, 0);
       const bOut = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.BoxGeometry(bZoneW, 0.01, bZoneD)),
         new THREE.LineBasicMaterial({ color: bColor, transparent: true, opacity: 0.42 })
       );
-      bOut.position.set(obs.pos[0], 0.007, obs.pos[2]);
-      if (obs.facing) {
-        const yaw = Math.atan2(-obs.facing[1], obs.facing[0]);
-        bFill.rotation.y = yaw;
-        bOut.rotation.y = yaw;
-      }
-      sensorZoneGroup.add(bFill, bOut);
+      bOut.position.set(0, 0.007, 0);
+      zoneGroup.add(bFill, bOut);
+      selData = makeSelectionFootprint(w, d, obs.color || '#a8a29e');
     }
 
+    selData.selFill.userData = { obstacle: obs };
+    editTargets.push(selData.selFill);
+    hitMeshes.push(selData.selFill);
+
+    const entry: ManagedObstacleEntry = {
+      id: obs.id,
+      type: obs.type,
+      propGroup,
+      orientGroup,
+      zoneGroup,
+      selGroup: selData.selGroup,
+      selFillMat: selData.selFillMat,
+      selEdgeMat: selData.selEdgeMat,
+      hitMeshes,
+    };
+    applyTransform(entry, obs);
+    entries.set(obs.id, entry);
     scene.add(propGroup);
   }
 
-  return clickTargets;
+  return {
+    getClickTargets: () => clickTargets,
+    getEditTargets: () => editTargets,
+    syncObstacle: (obs: StudioObstacleSpec) => {
+      const entry = entries.get(obs.id);
+      if (entry) applyTransform(entry, obs);
+    },
+    syncAll: (allSpecs: StudioObstacleSpec[]) => {
+      for (const obs of allSpecs) {
+        const entry = entries.get(obs.id);
+        if (entry) applyTransform(entry, obs);
+      }
+    },
+    setEditVisuals: (editActive: boolean, hoveredId: string | null, selectedId: string | null) => {
+      editOverlayGroup.visible = editActive;
+      if (!editActive) return;
+      for (const [id, entry] of entries) {
+        const isSel = id === selectedId;
+        const isHov = id === hoveredId;
+        if (isSel) {
+          entry.selEdgeMat.color.setHex(0x38bdf8);
+          entry.selEdgeMat.opacity = 0.98;
+          entry.selFillMat.color.setHex(0x38bdf8);
+          entry.selFillMat.opacity = 0.22;
+        } else if (isHov) {
+          entry.selEdgeMat.color.setHex(0xfbbf24);
+          entry.selEdgeMat.opacity = 0.88;
+          entry.selFillMat.color.setHex(0xfbbf24);
+          entry.selFillMat.opacity = 0.14;
+        } else {
+          entry.selEdgeMat.color.setHex(0x94a3b8);
+          entry.selEdgeMat.opacity = 0.45;
+          entry.selFillMat.color.setHex(0x94a3b8);
+          entry.selFillMat.opacity = 0.05;
+        }
+      }
+    },
+  };
 }

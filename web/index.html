@@ -79,9 +79,65 @@
       <!-- Live action/mode indicator (top-center, only shown during active motion modes) -->
       <div class="mode-pill hidden" id="mode-pill" role="status" aria-live="polite"></div>
 
-      <!-- Streamlined top-right 4-pill studio control bar + icon reset -->
+      <!-- Floating Edit Gym Toolbar (visible only while Edit Gym mode is active) -->
+      <div
+        class="edit-gym-bar hidden"
+        id="edit-gym-bar"
+        role="toolbar"
+        aria-label="Edit Gym Obstacle Layout"
+      >
+        <span class="edit-gym-badge">
+          <span class="edit-gym-dot" aria-hidden="true"></span>
+          <span id="edit-gym-label">Drag any prop on floor</span>
+        </span>
+        <span class="edit-gym-sep" aria-hidden="true"></span>
+        <button
+          type="button"
+          class="edit-gym-btn"
+          id="btn-edit-rotate"
+          disabled
+          title="Rotate selected obstacle 90° (R)"
+        >
+          Rotate 90°
+        </button>
+        <button
+          type="button"
+          class="edit-gym-btn"
+          id="btn-edit-shuffle"
+          title="Randomize all obstacle positions & orientations"
+        >
+          Shuffle
+        </button>
+        <button
+          type="button"
+          class="edit-gym-btn"
+          id="btn-edit-reset"
+          title="Restore default gym layout"
+        >
+          Reset
+        </button>
+        <button
+          type="button"
+          class="edit-gym-btn edit-gym-done"
+          id="btn-edit-done"
+          title="Exit Edit Gym mode (Esc / G)"
+        >
+          Done
+        </button>
+      </div>
+
+      <!-- Streamlined top-right studio control bar + icon reset -->
       <div class="hud-top-right" role="toolbar" aria-label="Studio controls">
         <div class="top-right-row">
+          <button
+            type="button"
+            class="pill-btn"
+            id="toggle-edit-gym"
+            aria-pressed="false"
+            title="Move, rotate & shuffle gym obstacles (G)"
+          >
+            Edit Gym
+          </button>
           <button
             type="button"
             class="pill-btn"

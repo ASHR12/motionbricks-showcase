@@ -27,7 +27,7 @@ import {
   type PS5InputSource,
 } from './ps5Input';
 import { PS5ControllerHUD } from './ps5Hud';
-import { buildStudioObstacles } from './studioProps';
+import { createStudioObstacleManager } from './studioProps';
 import { PAVILION_SPEC, ROOM_BOUNDS, STUDIO_CAMERAS, STUDIO_THEMES } from './studioSpec';
 
 const API_BASE = 'http://127.0.0.1:8765';
@@ -112,6 +112,13 @@ declare global {
       togglePS5Hud: () => void;
       toggleTheme: () => void;
       toggleHelp?: () => void;
+      toggleEditGym: () => void;
+      setEditGymMode: (active: boolean) => void;
+      moveObstacle: (id: string, x: number, z: number) => boolean;
+      rotateObstacle: (id: string) => boolean;
+      shuffleObstacles: () => void;
+      resetObstacles: () => void;
+      getObstacles: () => ObstacleInfo[];
       setCameraBookmark: (id: string) => void;
       setCameraOrbit: (yaw?: number, pitch?: number, dist?: number) => void;
       simulatePS5: (override: Parameters<DualSenseBridge['setSimulation']>[0]) => void;
@@ -259,6 +266,16 @@ async function boot(): Promise<void> {
   const numRenderJoints = initData.model.render_joints || 24;
   const numBoneJoints = boneNames.length || 26;
 
+  function cloneObstacles(list: ObstacleInfo[]): ObstacleInfo[] {
+    return list.map((o) => ({
+      ...o,
+      pos: [o.pos[0], o.pos[1], o.pos[2]] as [number, number, number],
+      size: [o.size[0], o.size[1], o.size[2]] as [number, number, number],
+      facing: o.facing ? ([o.facing[0], o.facing[1]] as [number, number]) : undefined,
+    }));
+  }
+  const defaultObstacles = cloneObstacles(initData.obstacles);
+
   // Wire top-left Engine Mode Slider (Pre-Baked <-> Live ONNX)
   const engineSliderEl = document.getElementById('engine-slider');
   const engineOptBakedEl = document.getElementById('engine-opt-baked');
@@ -371,7 +388,7 @@ async function boot(): Promise<void> {
   // Build crisp architectural studio parkour & interaction props + sensor pads
   const sensorZoneGroup = new THREE.Group();
   scene.add(sensorZoneGroup);
-  const obstacleMeshes = buildStudioObstacles(initData.obstacles, scene, sensorZoneGroup);
+  const obstacleManager = createStudioObstacleManager(initData.obstacles, scene, sensorZoneGroup);
 
   // AAA Smoothness Engine: Zero-GC Flat Buffers + Catmull-Rom + 120 ms Inertializer + Foot-Lock
   const inertializer = new MotionInertializer(numRenderJoints, numBoneJoints);
@@ -509,6 +526,7 @@ async function boot(): Promise<void> {
   let activeDuckObsId: string | null = null;
   let duckDir = -1;
   let duckX = 0;
+  let duckLane = 0;
   const obstacleCooldowns = new Map<string, number>();
   let syntheticSteer: THREE.Vector2 | null = null;
   let lastLatencyMs = 0;
@@ -658,6 +676,13 @@ async function boot(): Promise<void> {
   const moreEmotesGrid = document.getElementById('more-emotes-grid')!;
   const moreStylesWrap = btnMoreStyles.parentElement!;
   const subToggles = document.getElementById('sub-toggles')!;
+  const toggleEditGymBtn = document.getElementById('toggle-edit-gym') as HTMLButtonElement;
+  const editGymBar = document.getElementById('edit-gym-bar')!;
+  const editGymLabel = document.getElementById('edit-gym-label')!;
+  const btnEditRotate = document.getElementById('btn-edit-rotate') as HTMLButtonElement;
+  const btnEditShuffle = document.getElementById('btn-edit-shuffle') as HTMLButtonElement;
+  const btnEditReset = document.getElementById('btn-edit-reset') as HTMLButtonElement;
+  const btnEditDone = document.getElementById('btn-edit-done') as HTMLButtonElement;
   const toggleGuidesBtn = document.getElementById('toggle-guides')!;
   const toggleXRayBtn = document.getElementById('toggle-xray')!;
   const toggleAutoVaultBtn = document.getElementById('toggle-autovault')!;
@@ -693,6 +718,13 @@ async function boot(): Promise<void> {
   let lightTheme = false;
   let morePopoverOpen = false;
   let helpModalOpen = false;
+  let editGymMode = false;
+  let selectedObsId: string | null = null;
+  let hoveredObsId: string | null = null;
+  let draggingObs: ObstacleInfo | null = null;
+  const dragOffset = new THREE.Vector3();
+  const floorDragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const floorHitPoint = new THREE.Vector3();
   const emoteBtns = new Map<'look' | 'warmup', HTMLButtonElement>();
 
   const keys = new Set<string>();
@@ -973,7 +1005,7 @@ async function boot(): Promise<void> {
     if (wideCamMode) parts.push('Wide Cam');
     if (slowMo || ps5SlowMoHold) parts.push('0.25× Slow-Mo');
 
-    if (parts.length > 0) {
+    if (parts.length > 0 && !editGymMode) {
       modePill.textContent = parts.join('  ·  ');
       modePill.classList.remove('hidden');
     } else {
@@ -1209,8 +1241,16 @@ async function boot(): Promise<void> {
     const hx = dispPos[0];
     const hz = dispPos[2];
     activeDuckObsId = obs.id;
-    duckDir = hz <= obs.pos[2] ? 1 : -1;
-    duckX = THREE.MathUtils.clamp(hx - obs.pos[0], -0.65, 0.65) + obs.pos[0];
+    const crossZ = obs.size[2] < obs.size[0];
+    if (crossZ) {
+      duckDir = hz <= obs.pos[2] ? 1 : -1;
+      duckLane = THREE.MathUtils.clamp(hx - obs.pos[0], -0.65, 0.65) + obs.pos[0];
+      duckX = duckLane;
+    } else {
+      duckDir = hx <= obs.pos[0] ? 1 : -1;
+      duckLane = THREE.MathUtils.clamp(hz - obs.pos[2], -0.65, 0.65) + obs.pos[2];
+      duckX = obs.pos[0];
+    }
     gotoTarget = null;
     mode = fromAuto ? 'duck_action' : 'duck_entry';
     syncOverlayVisibility();
@@ -1367,6 +1407,207 @@ async function boot(): Promise<void> {
     setHelpModalOpen(!helpModalOpen);
   }
 
+  // =========================================================================
+  // EDIT GYM MODE: Live Drag / Rotate 90° / Shuffle / Reset Obstacle Layout
+  // Proves zero hardcoded coordinates across BOTH Live ONNX & Pre-Baked modes!
+  // =========================================================================
+  function shortObstacleLabel(obs: ObstacleInfo): string {
+    switch (obs.type) {
+      case 'vault':
+        return obs.id === 'stress_vault' ? 'Center Vault Wall' : 'Vault Plinth';
+      case 'duck':
+        return obs.id === 'stress_duck' ? 'Low Tunnel Gate' : 'Duck Gantry';
+      case 'sit':
+        return 'Gallery Bench';
+      case 'hurdle':
+        return obs.id === 'hurdle_rail_side' ? 'Hurdle Rail (Right)' : 'Hurdle Rail (Left)';
+      default:
+        return obs.label;
+    }
+  }
+
+  function clampObstaclePos(obs: ObstacleInfo, rawX: number, rawZ: number): [number, number] {
+    const halfX = obs.type === 'sit' ? Math.max(obs.size[0], obs.size[2]) * 0.5 : obs.size[0] * 0.5;
+    const halfZ = obs.type === 'sit' ? Math.max(obs.size[0], obs.size[2]) * 0.5 : obs.size[2] * 0.5;
+    const margin = 0.55;
+    const x = THREE.MathUtils.clamp(rawX, ROOM_BOUNDS.minX + halfX + margin, ROOM_BOUNDS.maxX - halfX - margin);
+    const z = THREE.MathUtils.clamp(rawZ, ROOM_BOUNDS.minZ + halfZ + margin, ROOM_BOUNDS.maxZ - halfZ - margin);
+    return [Number(x.toFixed(3)), Number(z.toFixed(3))];
+  }
+
+  function updateEditGymUI(): void {
+    toggleEditGymBtn.classList.toggle('active', editGymMode);
+    toggleEditGymBtn.setAttribute('aria-pressed', String(editGymMode));
+    editGymBar.classList.toggle('hidden', !editGymMode);
+    canvas.classList.toggle('edit-mode', editGymMode);
+    canvas.classList.toggle('edit-hover', editGymMode && hoveredObsId !== null && draggingObs === null);
+    canvas.classList.toggle('edit-dragging', editGymMode && draggingObs !== null);
+    obstacleManager.setEditVisuals(editGymMode, hoveredObsId, selectedObsId);
+
+    const sel = selectedObsId ? initData.obstacles.find((o) => o.id === selectedObsId) : undefined;
+    btnEditRotate.disabled = !sel;
+    if (sel) {
+      editGymLabel.textContent = `${shortObstacleLabel(sel)} · (${sel.pos[0].toFixed(1)}, ${sel.pos[2].toFixed(1)})`;
+    } else {
+      editGymLabel.textContent = 'Drag any prop on floor';
+    }
+    updateModeBanner();
+  }
+
+  function syncObstaclesToEngines(): void {
+    obstacleCooldowns.clear();
+    obstacleManager.syncAll(initData.obstacles);
+    motionBank?.setObstacles(initData.obstacles);
+    if (liveAvailable) {
+      void fetch(`${API_BASE}/api/obstacles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          obstacles: initData.obstacles,
+        }),
+      }).catch((err) => {
+        console.warn('[MotionBricks] Failed to sync obstacles to Live ONNX server:', err);
+      });
+    }
+  }
+
+  function setEditGymMode(active: boolean): void {
+    if (editGymMode === active) return;
+    editGymMode = active;
+    if (active) {
+      if (morePopoverOpen) setMorePopoverOpen(false);
+      if (helpModalOpen) setHelpModalOpen(false);
+    } else {
+      draggingObs = null;
+      hoveredObsId = null;
+      selectedObsId = null;
+    }
+    updateEditGymUI();
+  }
+
+  function toggleEditGym(): void {
+    setEditGymMode(!editGymMode);
+  }
+
+  function moveObstacleById(id: string, rawX: number, rawZ: number): boolean {
+    const obs = initData.obstacles.find((o) => o.id === id);
+    if (!obs) return false;
+    const [cx, cz] = clampObstaclePos(obs, rawX, rawZ);
+    obs.pos[0] = cx;
+    obs.pos[2] = cz;
+    selectedObsId = obs.id;
+    syncObstaclesToEngines();
+    updateEditGymUI();
+    return true;
+  }
+
+  function rotateObstacleById(id: string): boolean {
+    const obs = initData.obstacles.find((o) => o.id === id);
+    if (!obs) return false;
+    if (obs.type === 'sit') {
+      const fx = obs.facing ? obs.facing[0] : -0.8192;
+      const fz = obs.facing ? obs.facing[1] : 0.5736;
+      const len = Math.hypot(fx, fz) || 1;
+      // Rotate 90° around Y: (fx, fz) -> (-fz, fx)
+      obs.facing = [Number((-fz / len).toFixed(4)), Number((fx / len).toFixed(4))];
+    } else {
+      const tmp = obs.size[0];
+      obs.size[0] = obs.size[2];
+      obs.size[2] = tmp;
+      const [cx, cz] = clampObstaclePos(obs, obs.pos[0], obs.pos[2]);
+      obs.pos[0] = cx;
+      obs.pos[2] = cz;
+    }
+    selectedObsId = obs.id;
+    syncObstaclesToEngines();
+    updateEditGymUI();
+    return true;
+  }
+
+  function rotateSelectedObstacle(): void {
+    if (!selectedObsId) return;
+    rotateObstacleById(selectedObsId);
+  }
+
+  function shuffleGymObstacles(): void {
+    const runnerX = dispPos[0];
+    const runnerZ = dispPos[2];
+    const placed: Array<{ x: number; z: number; hx: number; hz: number }> = [];
+    const benchFacings: Array<[number, number]> = [
+      [-0.8192, 0.5736],
+      [0.8192, 0.5736],
+      [0.0, 1.0],
+      [1.0, 0.0],
+      [-1.0, 0.0],
+      [0.0, -1.0],
+    ];
+
+    for (const obs of initData.obstacles) {
+      // Randomly choose 0° or 90° orientation first
+      if (obs.type === 'sit') {
+        const pick = benchFacings[Math.floor(Math.random() * benchFacings.length)];
+        obs.facing = [pick[0], pick[1]];
+      } else if (Math.random() < 0.5) {
+        const tmp = obs.size[0];
+        obs.size[0] = obs.size[2];
+        obs.size[2] = tmp;
+      }
+
+      const hx = obs.type === 'sit' ? Math.max(obs.size[0], obs.size[2]) * 0.5 : obs.size[0] * 0.5;
+      const hz = obs.type === 'sit' ? Math.max(obs.size[0], obs.size[2]) * 0.5 : obs.size[2] * 0.5;
+      const minX = ROOM_BOUNDS.minX + hx + 1.2;
+      const maxX = ROOM_BOUNDS.maxX - hx - 1.2;
+      const minZ = Math.max(ROOM_BOUNDS.minZ + hz + 1.4, -14.8);
+      const maxZ = Math.min(ROOM_BOUNDS.maxZ - hz - 1.6, 4.2);
+
+      let chosenX = obs.pos[0];
+      let chosenZ = obs.pos[2];
+      let found = false;
+      for (let attempt = 0; attempt < 90; attempt++) {
+        const cx = minX + Math.random() * Math.max(0.5, maxX - minX);
+        const cz = minZ + Math.random() * Math.max(0.5, maxZ - minZ);
+        if (Math.hypot(cx - runnerX, cz - runnerZ) < 2.55) continue;
+        const pad = attempt < 55 ? 1.45 : 0.95;
+        let overlaps = false;
+        for (const p of placed) {
+          if (Math.abs(cx - p.x) < hx + p.hx + pad && Math.abs(cz - p.z) < hz + p.hz + pad) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) {
+          chosenX = cx;
+          chosenZ = cz;
+          found = true;
+          break;
+        }
+      }
+      const [fx, fz] = clampObstaclePos(obs, found ? chosenX : obs.pos[0], found ? chosenZ : obs.pos[2]);
+      obs.pos[0] = fx;
+      obs.pos[2] = fz;
+      placed.push({ x: fx, z: fz, hx, hz });
+    }
+
+    syncObstaclesToEngines();
+    selectedObsId = null;
+    updateEditGymUI();
+    editGymLabel.textContent = 'Shuffled 7 props';
+  }
+
+  function resetGymObstacles(): void {
+    const fresh = cloneObstacles(defaultObstacles);
+    for (let i = 0; i < initData.obstacles.length && i < fresh.length; i++) {
+      initData.obstacles[i].pos = fresh[i].pos;
+      initData.obstacles[i].size = fresh[i].size;
+      initData.obstacles[i].facing = fresh[i].facing;
+    }
+    syncObstaclesToEngines();
+    selectedObsId = null;
+    updateEditGymUI();
+    editGymLabel.textContent = 'Default layout restored';
+  }
+
   async function resetCharacter(): Promise<void> {
     mode = 'idle';
     gotoTarget = null;
@@ -1432,11 +1673,13 @@ async function boot(): Promise<void> {
     nextChunk = null;
     pendingInterrupt = null;
     if (engineMode === 'baked-bank' && motionBank) {
+      motionBank.setObstacles(initData.obstacles);
       motionBank.syncAnchor(dispPos[0], dispPos[2], lastSteerDir.x, lastSteerDir.y);
       const mbLabel = (motionBank.byteSize / (1024 * 1024)).toFixed(2);
       statMs.textContent = 'Pre-Baked';
       showEngineToast(`Switched to Pre-Baked neural bank (${mbLabel} MB · zero-server playback)`, 2800);
     } else {
+      syncObstaclesToEngines();
       showEngineToast('Switched to Live FP16 ONNX local server (~25 ms real-time inference)', 2800);
     }
     syncEngineSliderUI();
@@ -1462,6 +1705,11 @@ async function boot(): Promise<void> {
   });
 
   // Wire HUD buttons
+  toggleEditGymBtn.addEventListener('click', toggleEditGym);
+  btnEditRotate.addEventListener('click', rotateSelectedObstacle);
+  btnEditShuffle.addEventListener('click', shuffleGymObstacles);
+  btnEditReset.addEventListener('click', resetGymObstacles);
+  btnEditDone.addEventListener('click', () => setEditGymMode(false));
   toggleGuidesBtn.addEventListener('click', toggleGuides);
   toggleXRayBtn.addEventListener('click', toggleXRay);
   toggleAutoVaultBtn.addEventListener('click', () => {
@@ -1559,6 +1807,11 @@ async function boot(): Promise<void> {
       }
 
       const code = e.code;
+      if (code === 'Escape' && editGymMode) {
+        e.preventDefault();
+        setEditGymMode(false);
+        return;
+      }
       if (code === 'Escape' && morePopoverOpen) {
         setMorePopoverOpen(false);
         btnMoreStyles.focus();
@@ -1566,6 +1819,11 @@ async function boot(): Promise<void> {
       }
       keys.add(code);
       syncKeycapLights();
+
+      if (code === 'KeyG' && !e.repeat) {
+        toggleEditGym();
+        return;
+      }
 
       if (code === 'Tab') {
         e.preventDefault();
@@ -1630,7 +1888,11 @@ async function boot(): Promise<void> {
         return;
       }
       if (code === 'KeyR' && !e.repeat) {
-        void resetCharacter();
+        if (editGymMode) {
+          rotateSelectedObstacle();
+        } else {
+          void resetCharacter();
+        }
         return;
       }
       if (code.startsWith('Digit') && !e.repeat) {
@@ -1708,7 +1970,7 @@ async function boot(): Promise<void> {
     return applyWallSlideToSteer(new THREE.Vector2(dx / len, dz / len));
   }
 
-  // Pointer orbit + click floor / click obstacle (click-to-move locked when PS5 is connected!)
+  // Pointer orbit + click floor / click obstacle + Edit Gym floor-plane drag
   let dragging = false;
   let pointerDownX = 0;
   let pointerDownY = 0;
@@ -1716,37 +1978,112 @@ async function boot(): Promise<void> {
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
 
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-  canvas.addEventListener('pointerdown', (e) => {
-    dragging = true;
-    pointerMoved = false;
-    pointerDownX = e.clientX;
-    pointerDownY = e.clientY;
-    canvas.setPointerCapture(e.pointerId);
-  });
-
-  canvas.addEventListener('pointermove', (e) => {
-    if (!dragging) return;
-    if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 4) pointerMoved = true;
-    camRecenterYaw = null;
-    camYaw -= e.movementX * 0.0040;
-    camPitch = THREE.MathUtils.clamp(camPitch + e.movementY * 0.0045, -0.14, 1.05);
-  });
-
-  canvas.addEventListener('pointerup', (e) => {
-    dragging = false;
-    canvas.releasePointerCapture(e.pointerId);
-    if (pointerMoved || e.button !== 0) return;
-    // STRICT PS5 EXCLUSIVE: block floor click-to-move & obstacle click while PS5 is connected!
-    if (ps5.isConnected()) return;
-
+  function setRayFromPointer(e: PointerEvent): void {
     const rect = canvas.getBoundingClientRect();
     ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(ndc, camera);
+  }
 
-    const obsHits = raycaster.intersectObjects(obstacleMeshes, false);
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  canvas.addEventListener('pointerdown', (e) => {
+    pointerMoved = false;
+    pointerDownX = e.clientX;
+    pointerDownY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+
+    if (editGymMode && e.button === 0) {
+      setRayFromPointer(e);
+      const obsHits = raycaster.intersectObjects(obstacleManager.getEditTargets(), false);
+      if (obsHits.length > 0) {
+        const obs = obsHits[0].object.userData.obstacle as ObstacleInfo;
+        selectedObsId = obs.id;
+        hoveredObsId = obs.id;
+        draggingObs = obs;
+        if (raycaster.ray.intersectPlane(floorDragPlane, floorHitPoint)) {
+          dragOffset.set(obs.pos[0] - floorHitPoint.x, 0, obs.pos[2] - floorHitPoint.z);
+        } else {
+          dragOffset.set(0, 0, 0);
+        }
+        updateEditGymUI();
+        return;
+      }
+    }
+
+    dragging = true;
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (draggingObs) {
+      if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 2) pointerMoved = true;
+      setRayFromPointer(e);
+      if (raycaster.ray.intersectPlane(floorDragPlane, floorHitPoint)) {
+        const [cx, cz] = clampObstaclePos(
+          draggingObs,
+          floorHitPoint.x + dragOffset.x,
+          floorHitPoint.z + dragOffset.z
+        );
+        draggingObs.pos[0] = cx;
+        draggingObs.pos[2] = cz;
+        obstacleManager.syncObstacle(draggingObs);
+        editGymLabel.textContent = `${shortObstacleLabel(draggingObs)} · (${cx.toFixed(1)}, ${cz.toFixed(1)})`;
+      }
+      return;
+    }
+
+    if (dragging) {
+      if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 4) pointerMoved = true;
+      camRecenterYaw = null;
+      camYaw -= e.movementX * 0.0040;
+      camPitch = THREE.MathUtils.clamp(camPitch + e.movementY * 0.0045, -0.14, 1.05);
+      return;
+    }
+
+    if (editGymMode) {
+      setRayFromPointer(e);
+      const obsHits = raycaster.intersectObjects(obstacleManager.getEditTargets(), false);
+      const nextHover =
+        obsHits.length > 0 ? (obsHits[0].object.userData.obstacle as ObstacleInfo).id : null;
+      if (nextHover !== hoveredObsId) {
+        hoveredObsId = nextHover;
+        updateEditGymUI();
+      }
+    }
+  });
+
+  canvas.addEventListener('pointerup', (e) => {
+    if (canvas.hasPointerCapture(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId);
+    }
+
+    if (draggingObs) {
+      const moved = pointerMoved;
+      draggingObs = null;
+      if (moved) {
+        syncObstaclesToEngines();
+      }
+      updateEditGymUI();
+      return;
+    }
+
+    dragging = false;
+
+    if (editGymMode) {
+      if (!pointerMoved && e.button === 0) {
+        selectedObsId = null;
+        updateEditGymUI();
+      }
+      return;
+    }
+
+    if (pointerMoved || e.button !== 0) return;
+    // STRICT PS5 EXCLUSIVE: block floor click-to-move & obstacle click while PS5 is connected!
+    if (ps5.isConnected()) return;
+
+    setRayFromPointer(e);
+
+    const obsHits = raycaster.intersectObjects(obstacleManager.getClickTargets(), false);
     if (obsHits.length > 0) {
       const obs = obsHits[0].object.userData.obstacle as ObstacleInfo;
       if (obs.type === 'vault') startVault(false, obs);
@@ -1760,6 +2097,13 @@ async function boot(): Promise<void> {
     if (floorHits.length > 0) {
       const pt = floorHits[0].point;
       startGoto(pt.x, pt.z);
+    }
+  });
+
+  canvas.addEventListener('pointerleave', () => {
+    if (editGymMode && !draggingObs && hoveredObsId !== null) {
+      hoveredObsId = null;
+      updateEditGymUI();
     }
   });
 
@@ -1821,6 +2165,7 @@ async function boot(): Promise<void> {
       body.obstacle_id = activeDuckObsId;
       body.duck_dir = duckDir;
       body.duck_x = duckX;
+      body.duck_lane = duckLane;
     }
     return body;
   }
@@ -2024,6 +2369,13 @@ async function boot(): Promise<void> {
     togglePS5Hud,
     toggleTheme,
     toggleHelp,
+    toggleEditGym,
+    setEditGymMode,
+    moveObstacle: moveObstacleById,
+    rotateObstacle: rotateObstacleById,
+    shuffleObstacles: shuffleGymObstacles,
+    resetObstacles: resetGymObstacles,
+    getObstacles: () => cloneObstacles(initData.obstacles),
     setCameraBookmark,
     setCameraOrbit: (yaw?: number, pitch?: number, dist?: number) => {
       camRecenterYaw = null;
@@ -2047,6 +2399,8 @@ async function boot(): Promise<void> {
       xrayMode,
       lightTheme,
       helpModalOpen,
+      editGymMode,
+      selectedObsId,
       ps5HudVisible,
       ps5Connected: ps5.isConnected(),
       keyboardLocked: ps5.isConnected(),
